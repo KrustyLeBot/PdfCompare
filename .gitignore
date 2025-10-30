@@ -4,3 +4,5 @@
 *.ptx
 *.cubin
 *.fatbin
+.env
+Gitlab/cve_progress_*.txt
