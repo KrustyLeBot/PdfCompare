@@ -1,5 +1,14 @@
 #!/bin/bash
 
+# Check if pipeline ID argument is provided
+if [ -z "$1" ]; then
+    echo "Usage: $0 <pipeline_id>"
+    echo "Example: $0 12345"
+    exit 1
+fi
+
+EXCLUDE_PIPELINE_ID="$1"
+
 # Log colors
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -24,19 +33,12 @@ fi
 # Configuration (use variables directly from .env)
 PROJECT_ID="$GITLAB_PROJECT_ID"
 PRIVATE_TOKEN="$GITLAB_PRIVATE_TOKEN"
-EXCLUDE_PIPELINE_ID=xxxxxxx
 PER_PAGE=100
 PROGRESS_FILE="cve_progress_${PROJECT_ID}.txt"
 
 # Validate configuration
 if [ -z "$GITLAB_URL" ] || [ -z "$PRIVATE_TOKEN" ] || [ -z "$PROJECT_ID" ]; then
     echo -e "${RED}Error: Missing required environment variables!${NC}"
-    exit 1
-fi
-
-if [ "$EXCLUDE_PIPELINE_ID" = "xxxxxxx" ]; then
-    echo -e "${RED}Error: EXCLUDE_PIPELINE_ID has not been configured!${NC}"
-    echo "Please edit the script and set a valid pipeline ID."
     exit 1
 fi
 
@@ -127,30 +129,30 @@ EOF
     if [ "$filtered_count" -gt 0 ]; then
         echo -e "${YELLOW}Resolving $filtered_count CVEs...${NC}"
         
-        temp_dir=$(mktemp -d)
+        resolved=0
+        failed=0
         
         echo "$filtered" | jq -r '.[] | .id' | while read vuln_id; do
             (
-                response=$(curl -s -w "\n%{http_code}" --request POST \
+                http_code=$(curl -s -w "%{http_code}" -o /dev/null --request POST \
                     --header "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
                     "${GITLAB_URL}/api/v4/vulnerabilities/$vuln_id/resolve")
                 
-                http_code=$(echo "$response" | tail -n1)
-                
                 if [ "$http_code" -eq 200 ] || [ "$http_code" -eq 201 ]; then
-                    echo "success" > "$temp_dir/$vuln_id"
+                    echo "SUCCESS"
                 else
-                    echo "failed" > "$temp_dir/$vuln_id"
+                    echo "FAILED"
                 fi
             ) &
+        done | while read result; do
+            if [ "$result" = "SUCCESS" ]; then
+                ((resolved++))
+            else
+                ((failed++))
+            fi
         done
         
         wait
-        
-        resolved=$(find "$temp_dir" -type f -exec grep -l "success" {} \; 2>/dev/null | wc -l)
-        failed=$(find "$temp_dir" -type f -exec grep -l "failed" {} \; 2>/dev/null | wc -l)
-        
-        rm -rf "$temp_dir"
         
         echo -e "${GREEN}✓ Resolved: $resolved | Failed: $failed${NC}"
         total_resolved=$((total_resolved + resolved))
