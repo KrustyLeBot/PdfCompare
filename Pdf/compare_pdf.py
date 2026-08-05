@@ -86,6 +86,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "bg_noir": "black",
         "bg_blanc": "white",
         "start_hint": "Pick two PDFs, then Compare.",
+        "dpi_detected": "Resolution set to {dpi} dpi (native resolution of PDF 1).",
         "scanning": "Scanning...",
         "scanning_page": "Scanning page {done}/{total}...",
         "page_status": ("Page {page}/{total} — {ratio:.3f}% of pixels differ, "
@@ -163,6 +164,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "bg_noir": "noir",
         "bg_blanc": "blanc",
         "start_hint": "Choisir deux PDF puis Comparer.",
+        "dpi_detected": "Resolution reglee sur {dpi} dpi (resolution native du PDF 1).",
         "scanning": "Analyse...",
         "scanning_page": "Analyse page {done}/{total}...",
         "page_status": ("Page {page}/{total} — {ratio:.3f}% de pixels differents, "
@@ -255,9 +257,44 @@ BYTES_PER_PX = 8            # a PageDiff keeps 2 RGB planes + 2 bool masks
 HANDLE_GRAB = 22            # px around the divider that grab it instead of panning
 
 
+DEFAULT_DPI = 200
+DPI_LIMITS = (96, 300)  # a page at 300 dpi already weighs ~120 MB in the cache
+
+
+def native_dpi(path: Path, pages: int = 3) -> int | None:
+    """Effective dpi of the raster content of a PDF, if it has any.
+
+    A scanned page is one big image placed on the page box: comparing it below
+    its own resolution throws away detail and invents anti-aliasing differences,
+    so the viewer defaults to that resolution. Vector-only PDFs return None.
+    """
+    try:
+        doc = fitz.open(path)
+    except Exception:
+        return None
+    best = 0.0
+    try:
+        for index in range(min(pages, doc.page_count)):
+            page = doc.load_page(index)
+            page_area = page.rect.width * page.rect.height
+            for info in page.get_image_info():
+                x0, y0, x1, y1 = info["bbox"]
+                w, h = x1 - x0, y1 - y0
+                if w < 20 or h < 20 or page_area <= 0:
+                    continue
+                if w * h < 0.25 * page_area:  # logos and stamps say nothing
+                    continue
+                best = max(best, info["width"] * 72.0 / w, info["height"] * 72.0 / h)
+    except Exception:
+        return None
+    finally:
+        doc.close()
+    return int(round(best)) if best else None
+
+
 @dataclass
 class Options:
-    dpi: int = 150
+    dpi: int = DEFAULT_DPI
     # per-channel difference (0-255) above which a pixel counts as changed
     threshold: int = 20
     # context kept around each change, in points (1/72 inch), scaled to the dpi
@@ -784,6 +821,7 @@ ZOOM_STEPS = (0.1, 0.15, 0.25, 0.33, 0.5, 0.66, 0.8, 1.0, 1.25, 1.5, 2.0, 3.0, 4
 BOX_COLOR = "#ff00dc"
 CANVAS_BG = (58, 58, 58)
 IMAGE_CACHE = 10       # page images (full size or pre-scaled) kept around
+SLICE_CACHE = 8        # scaled visible slices kept around
 PRESCALE_BELOW = 0.5   # zoom under which whole pages are pre-scaled and cached
 QUALITY_DELAY = 110    # ms of calm before repainting with the good filter
 
@@ -826,6 +864,7 @@ class App(ttk.Frame):
         self._frame_photo: ImageTk.PhotoImage | None = None
         self._frame_item: int | None = None
         self._images: OrderedDict[tuple, Image.Image] = OrderedDict()
+        self._slices: OrderedDict[tuple, Image.Image] = OrderedDict()
         self._overlays: OrderedDict[tuple, np.ndarray] = OrderedDict()
         self._layout_cache: tuple | None = None
         self._ref = (0.0, 1.0)  # divider reference: page left x, page width (canvas px)
@@ -833,7 +872,7 @@ class App(ttk.Frame):
 
         self.path_a = tk.StringVar()
         self.path_b = tk.StringVar()
-        self.dpi = tk.IntVar(value=150)
+        self.dpi = tk.IntVar(value=DEFAULT_DPI)
         self.threshold = tk.IntVar(value=20)
         self.radius = tk.DoubleVar(value=10.0)
         self.min_area = tk.IntVar(value=12)
@@ -852,8 +891,8 @@ class App(ttk.Frame):
         self._build_statusbar()
         self._bind_keys()
         self._setup_dnd()
-        for var in (self.path_a, self.path_b):
-            var.trace_add("write", lambda *_: self._schedule_redraw())
+        self.path_a.trace_add("write", lambda *_: self._on_before_changed())
+        self.path_b.trace_add("write", lambda *_: self._schedule_redraw())
         self._schedule_redraw()
         self.after(50, self._tick)
 
@@ -1105,6 +1144,20 @@ class App(ttk.Frame):
         if path:
             var.set(path)
 
+    def _on_before_changed(self):
+        """Adopt the native resolution of the 'before' PDF when it has one."""
+        self._schedule_redraw()
+        path = self.path_a.get().strip()
+        if not path or not Path(path).is_file():
+            return
+        found = native_dpi(Path(path))
+        if not found:
+            return
+        value = max(DPI_LIMITS[0], min(DPI_LIMITS[1], found))
+        if value != self.dpi.get():
+            self.dpi.set(value)
+            self.status.set(T("dpi_detected", dpi=value))
+
     def current_options(self) -> Options:
         return Options(
             dpi=self.dpi.get(), threshold=self.threshold.get(), radius_pt=self.radius.get(),
@@ -1159,6 +1212,7 @@ class App(ttk.Frame):
 
     def _invalidate_caches(self):
         self._images.clear()
+        self._slices.clear()
         self._overlays.clear()
         self._layout_cache = None
 
@@ -1228,7 +1282,7 @@ class App(ttk.Frame):
         self.after(50, self._tick)
 
     def _drop_page_caches(self, index: int):
-        for cache in (self._images, self._overlays):
+        for cache in (self._images, self._slices, self._overlays):
             for key in [k for k in cache if k[0] == index]:
                 cache.pop(key, None)
 
@@ -1475,17 +1529,31 @@ class App(ttk.Frame):
             self._images.move_to_end(ck)
         return img
 
-    def _view_pieces(self, sx0: int, sx1: int, split_src: int) -> list[tuple[str, int, int]]:
-        """Which page source feeds which horizontal span of the visible slice."""
-        view = self.view.get()
-        if view != "slide":
-            return [({"avant": "a", "apres": "b"}.get(view, "overlay"), sx0, sx1)]
-        pieces = []
-        if split_src > sx0:  # before, left of the divider
-            pieces.append(("a", sx0, min(sx1, split_src)))
-        if split_src < sx1:  # after, right of the divider
-            pieces.append(("b", max(sx0, split_src), sx1))
-        return pieces
+    def _slice(self, index: int, pd: PageDiff, key: str, box: tuple[int, int, int, int],
+               dest_size: tuple[int, int], display: tuple[int, int] | None) -> Image.Image:
+        """One visible slice of a page source, scaled to screen and cached.
+
+        Caching per (page, source, box, size, filter) is what makes wiping cheap
+        and, above all, stable: dragging the divider reuses the very same scaled
+        slices, so nothing is re-sampled and the image cannot shift by a pixel.
+        """
+        ck = (index, key, box, dest_size, self._fast_paint,
+              self.background.get() if key == "overlay" else None)
+        img = self._slices.get(ck)
+        if img is None:
+            img = self._page_image(index, pd, key, display).crop(box)
+            if img.size != dest_size:
+                smooth = dest_size[0] < img.size[0] and not self._fast_paint
+                img = img.resize(dest_size, Image.BILINEAR if smooth else Image.NEAREST)
+            if len(self._slices) > SLICE_CACHE:
+                self._slices.popitem(last=False)
+            self._slices[ck] = img
+        else:
+            self._slices.move_to_end(ck)
+        return img
+
+    def _source_key(self) -> str:
+        return {"avant": "a", "apres": "b", "overlay": "overlay"}.get(self.view.get(), "b")
 
     # -- painting --------------------------------------------------------- #
 
@@ -1530,10 +1598,21 @@ class App(ttk.Frame):
                 0, 0, anchor="nw", image=self._frame_photo)
             self.canvas.tag_lower(self._frame_item)
 
+    def _clear_overlay_items(self):
+        """Drop every canvas item except the framebuffer image.
+
+        Deliberately not tag-based: a create_* call missing its tag would leak
+        items on every repaint, which is exactly how ghost text piled up on the
+        drop panels.
+        """
+        for item in self.canvas.find_all():
+            if item != self._frame_item:
+                self.canvas.delete(item)
+
     def _redraw(self):
         self._redraw_pending = False
         vw, vh = self._viewport()
-        self.canvas.delete("vec")
+        self._clear_overlay_items()
         self._ensure_frame(vw, vh)
         if not self.session:
             self._commit_frame()
@@ -1595,7 +1674,6 @@ class App(ttk.Frame):
             scale = 1.0  # the cached copy is already at screen size
             sx0, sy0 = int(vx0), int(vy0)
             sx1, sy1 = min(display[0], math.ceil(vx1)), min(display[1], math.ceil(vy1))
-            split_src = int(round(self.split * display[0]))
         else:
             display = None
             scale = zoom
@@ -1603,24 +1681,28 @@ class App(ttk.Frame):
             sx0, sy0 = int(vx0 / zoom), int(vy0 / zoom)
             sx1 = min(w, math.ceil(vx1 / zoom) + 1)
             sy1 = min(h, math.ceil(vy1 / zoom) + 1)
-            split_src = int(round(self.split * w))
         if sx1 <= sx0 or sy1 <= sy0:
             return
 
-        for key, px0, px1 in self._view_pieces(sx0, sx1, split_src):
-            if px1 <= px0:
-                continue
-            crop = self._page_image(index, pd, key, display).crop((px0, sy0, px1, sy1))
-            if scale != 1.0:
-                dw = max(1, int(round((px1 - px0) * scale)))
-                dh = max(1, int(round((sy1 - sy0) * scale)))
-                if (dw, dh) != crop.size:
-                    # NEAREST is ~10x faster and is what interactive frames use;
-                    # BILINEAR only kicks in for the settled, final repaint.
-                    smooth = scale < 1 and not self._fast_paint
-                    crop = crop.resize((dw, dh), Image.BILINEAR if smooth else Image.NEAREST)
-            self._blit(crop, int(round(page_x + px0 * scale)),
-                       int(round(page_y + sy0 * scale)))
+        box = (sx0, sy0, sx1, sy1)
+        dest_size = (max(1, int(round((sx1 - sx0) * scale))),
+                     max(1, int(round((sy1 - sy0) * scale))))
+        dest_x = int(round(page_x + sx0 * scale))
+        dest_y = int(round(page_y + sy0 * scale))
+
+        if self.view.get() != "slide":
+            self._blit(self._slice(index, pd, self._source_key(), box, dest_size, display),
+                       dest_x, dest_y)
+        else:
+            # Both halves come from slices sharing one box and one scale, so they
+            # sit on the same pixel grid; the seam is then cut on a whole
+            # destination pixel and the divider is drawn exactly there.
+            after = self._slice(index, pd, "b", box, dest_size, display)
+            self._blit(after, dest_x, dest_y)
+            cut = max(0, min(dest_size[0], int(round(page_x + self.split * pw)) - dest_x))
+            if cut:
+                before = self._slice(index, pd, "a", box, dest_size, display)
+                self._blit(before.crop((0, 0, cut, dest_size[1])), dest_x, dest_y)
         self._draw_page_frame(index, page_x, page_y, pw, ph)
         if self.boxes.get():
             self._draw_boxes(pd.stats.regions, self.zoom, page_x, page_y)
@@ -1669,7 +1751,7 @@ class App(ttk.Frame):
         vw, vh = self._viewport()
         for _, ytop, pw, ph in visible:
             page_x = (max_w - pw) / 2 - self.ox + pad_x
-            x = page_x + self.split * pw
+            x = float(int(round(page_x + self.split * pw)))  # the seam pixel
             if x < 0 or x > vw:
                 continue
             top = max(0.0, ytop - self.oy + pad_y)
@@ -1749,7 +1831,8 @@ class App(ttk.Frame):
                                     fill="#e8e8e8" if hot else "#b8b8b8",
                                     font=("Segoe UI", 12, "bold"), tags="vec")
             self.canvas.create_text((x0 + x1) / 2, cy + 2, text=detail, fill=colour,
-                                    font=("Segoe UI", 10), width=max(80, (x1 - x0) - 40))
+                                    font=("Segoe UI", 10), tags="vec",
+                                    width=max(80, (x1 - x0) - 40))
             if path and not hot:
                 self.canvas.create_text((x0 + x1) / 2, cy + 26, text=T("panel_ok"),
                                         fill="#8fdc9a", font=("Segoe UI", 9), tags="vec")
@@ -1779,10 +1862,12 @@ class App(ttk.Frame):
         """The current view of the current page, full resolution, for saving."""
         pd = self.session.get_or_compute(self.current)
         w, h = pd.size
-        img = Image.new("RGB", (w, h))
-        for key, x0, x1 in self._view_pieces(0, w, int(round(self.split * w))):
-            piece = self._page_image(self.current, pd, key, None).crop((x0, 0, x1, h))
-            img.paste(piece, (x0, 0))
+        img = self._page_image(self.current, pd, self._source_key(), None).copy()
+        if self.view.get() == "slide":
+            cut = max(0, min(w, int(round(self.split * w))))
+            if cut:
+                before = self._page_image(self.current, pd, "a", None)
+                img.paste(before.crop((0, 0, cut, h)), (0, 0))
         if self.boxes.get() and pd.stats.regions:
             draw = ImageDraw.Draw(img)
             pen = max(1, int(round(self.session.opt.dpi / 96.0)))

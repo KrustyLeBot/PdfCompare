@@ -55,7 +55,8 @@ A Windows GUI that renders two PDFs and shows what changed, page by page.
 
 ### Options
 
-`dpi` render resolution (150 is a good default; raise it to inspect fine print) ·
+`dpi` render resolution — defaults to 200, or to the native resolution of PDF 1
+when it is a scan (clamped to 96-300) ·
 `threshold` per-channel difference (0-255) above which a pixel counts as changed ·
 `radius` context kept around each change, in points · `min area` discards blobs
 smaller than N pixels (anti-aliasing noise) · `background` checkerboard / black /
