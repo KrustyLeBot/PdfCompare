@@ -90,9 +90,9 @@ EOF
     echo -e "${YELLOW}Fetching page $current_page...${NC}"
     
     # Build API URL
-    api_url="${GITLAB_URL}/api/v4/projects/${PROJECT_ID}/vulnerabilities?per_page=${PER_PAGE}&page=${current_page}&severity=medium&severity=low"
+    api_url="${GITLAB_URL}/api/v4/projects/${PROJECT_ID}/vulnerabilities?per_page=${PER_PAGE}&page=${current_page}"
     
-    http_code=$(curl -s -w "%{http_code}" --max-time 30 \
+    http_code=$(curl -s -w "%{http_code}" --max-time 30 -L \
         --header "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
         -D "$headers_file" \
         -o "$temp_file" \
@@ -100,6 +100,11 @@ EOF
     
     if [ "$http_code" -ne 200 ]; then
         echo -e "${RED}HTTP Error: $http_code${NC}"
+        if [ "$http_code" -eq 302 ] || [ "$http_code" -eq 301 ]; then
+            redirect_location=$(grep -i "^Location:" "$headers_file" | cut -d' ' -f2- | tr -d '\r')
+            [ -n "$redirect_location" ] && echo -e "${YELLOW}Redirect to: $redirect_location${NC}"
+            echo -e "${YELLOW}Verify your GITLAB_URL and GITLAB_PRIVATE_TOKEN in .env${NC}"
+        fi
         rm -f "$temp_file" "$headers_file"
         break
     fi
@@ -125,37 +130,32 @@ EOF
     filtered_count=$(echo "$filtered" | jq '. | length' 2>/dev/null || echo "0")
     echo -e "${GREEN}→ $raw_count total, $filtered_count to resolve${NC}"
     
-    # Resolve CVEs in parallel
+    # Resolve CVEs in parallel (max 5 at a time to avoid rate limiting)
     if [ "$filtered_count" -gt 0 ]; then
         echo -e "${YELLOW}Resolving $filtered_count CVEs...${NC}"
         
-        resolved=0
-        failed=0
+        temp_ids=$(mktemp)
+        temp_results=$(mktemp)
         
-        echo "$filtered" | jq -r '.[] | .id' | while read vuln_id; do
-            (
-                http_code=$(curl -s -w "%{http_code}" -o /dev/null --request POST \
-                    --header "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
-                    "${GITLAB_URL}/api/v4/vulnerabilities/$vuln_id/resolve")
-                
-                if [ "$http_code" -eq 200 ] || [ "$http_code" -eq 201 ]; then
-                    echo "SUCCESS"
-                else
-                    echo "FAILED"
-                fi
-            ) &
-        done | while read result; do
-            if [ "$result" = "SUCCESS" ]; then
-                ((resolved++))
-            else
-                ((failed++))
+        echo "$filtered" | jq -r '.[] | .id' > "$temp_ids"
+        
+        # Use xargs to limit parallel jobs to 5
+        cat "$temp_ids" | xargs -P 5 -I {} bash -c '
+            sleep 0.2
+            http_code=$(curl -s -w "%{http_code}" -o /dev/null --max-time 30 -L --request POST \
+                --header "PRIVATE-TOKEN: '"${PRIVATE_TOKEN}"'" \
+                "'"${GITLAB_URL}"'/api/v4/vulnerabilities/{}/resolve")
+            
+            if [ "$http_code" -eq 200 ] || [ "$http_code" -eq 201 ]; then
+                echo "SUCCESS"
             fi
-        done
+        ' >> "$temp_results"
         
-        wait
-        
-        echo -e "${GREEN}✓ Resolved: $resolved | Failed: $failed${NC}"
+        resolved=$(grep -c "SUCCESS" "$temp_results" 2>/dev/null)
+        resolved=${resolved:-0}
+        echo -e "${GREEN}✓ Resolved: $resolved${NC}"
         total_resolved=$((total_resolved + resolved))
+        rm -f "$temp_ids" "$temp_results"
     fi
     
     total_pages_processed=$((total_pages_processed + 1))
