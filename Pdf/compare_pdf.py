@@ -27,12 +27,14 @@ from __future__ import annotations
 
 import locale
 import math
+import multiprocessing
 import os
 import queue
 import sys
 import threading
 import tkinter as tk
 from collections import OrderedDict
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -253,7 +255,6 @@ BACKGROUNDS = ("damier", "noir", "blanc")
 SCAN_DPI = 72               # cheap pass used to flag which pages differ
 PAGE_GAP = 14               # px between pages in the scrollable strip
 MEM_BUDGET = 400 * 1024**2  # cache ceiling for compared pages
-BYTES_PER_PX = 8            # a PageDiff keeps 2 RGB planes + 2 bool masks
 HANDLE_GRAB = 22            # px around the divider that grab it instead of panning
 
 
@@ -425,38 +426,72 @@ def _regions_in(mask: np.ndarray, block: int, min_area: int) -> list[Region]:
     bw = (w + block - 1) // block
     padded = np.zeros((bh * block, bw * block), dtype=bool)
     padded[:h, :w] = mask
-    cells = padded.reshape(bh, block, bw, block)
-    grid = cells.any(axis=(1, 3))
-    counts = cells.sum(axis=(1, 3))
+    # two contiguous sums: 3x faster than reducing a 4-D view over axes (1, 3)
+    rows = padded.view(np.uint8).reshape(bh, block, bw * block).sum(axis=1, dtype=np.uint16)
+    counts = rows.reshape(bh, bw, block).sum(axis=2, dtype=np.int32)
+    grid = counts > 0
 
-    labels = np.zeros((bh, bw), dtype=np.int32)
+    # Horizontal runs of set cells, found with numpy; only the runs go through
+    # Python (union-find), which is orders of magnitude fewer than the cells.
+    edges = np.diff(np.pad(grid, ((0, 0), (1, 1))).astype(np.int8), axis=1)
+    run_y, run_x0 = np.nonzero(edges == 1)
+    _, run_x1 = np.nonzero(edges == -1)  # exclusive; same row-major order as starts
+    n = run_y.size
+    if not n:
+        return []
+    csum = np.zeros((bh, bw + 1), dtype=np.int64)
+    np.cumsum(counts, axis=1, out=csum[:, 1:])
+    run_area = csum[run_y, run_x1] - csum[run_y, run_x0]
+
+    ys, x0s, x1s = run_y.tolist(), run_x0.tolist(), run_x1.tolist()
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    prev_start = prev_end = cur_start = 0
+    j = 0
+    for i in range(n):
+        if i == 0 or ys[i] != ys[i - 1]:
+            if i and ys[i] == ys[i - 1] + 1:
+                prev_start, prev_end = cur_start, i
+            else:
+                prev_start = prev_end = i
+            cur_start, j = i, prev_start
+        # 8-connectivity: runs touch when they overlap or meet at a corner
+        while j < prev_end and x1s[j] < x0s[i]:
+            j += 1
+        k = j
+        while k < prev_end and x0s[k] <= x1s[i]:
+            ri, rk = find(i), find(k)
+            if ri != rk:  # the earliest run stays root: keeps raster order
+                parent[max(ri, rk)] = min(ri, rk)
+            k += 1
+
+    roots = np.fromiter((find(i) for i in range(n)), dtype=np.int64, count=n)
+    _, label = np.unique(roots, return_inverse=True)
+    count = int(label.max()) + 1
+    bx0 = np.full(count, bw, dtype=np.int64)
+    by0 = np.full(count, bh, dtype=np.int64)
+    bx1 = np.zeros(count, dtype=np.int64)
+    by1 = np.zeros(count, dtype=np.int64)
+    area = np.zeros(count, dtype=np.int64)
+    np.minimum.at(bx0, label, run_x0)
+    np.minimum.at(by0, label, run_y)
+    np.maximum.at(bx1, label, run_x1)
+    np.maximum.at(by1, label, run_y + 1)
+    np.add.at(area, label, run_area)
+
     regions: list[Region] = []
-    neighbours = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
-    current = 0
-    for sy in range(bh):
-        for sx in range(bw):
-            if not grid[sy, sx] or labels[sy, sx]:
-                continue
-            current += 1
-            labels[sy, sx] = current
-            stack = [(sy, sx)]
-            blob = []
-            while stack:
-                y, x = stack.pop()
-                blob.append((y, x))
-                for dy, dx in neighbours:
-                    ny, nx = y + dy, x + dx
-                    if 0 <= ny < bh and 0 <= nx < bw and grid[ny, nx] and not labels[ny, nx]:
-                        labels[ny, nx] = current
-                        stack.append((ny, nx))
-            ys = [c[0] for c in blob]
-            xs = [c[1] for c in blob]
-            area = int(sum(counts[y, x] for y, x in blob))
-            if area < min_area:
-                continue
-            regions.append(Region(x0=min(xs) * block, y0=min(ys) * block,
-                                  x1=min(w, (max(xs) + 1) * block),
-                                  y1=min(h, (max(ys) + 1) * block), area=area))
+    for c in range(count):
+        if area[c] < min_area:
+            continue
+        regions.append(Region(x0=int(bx0[c]) * block, y0=int(by0[c]) * block,
+                              x1=min(w, int(bx1[c]) * block),
+                              y1=min(h, int(by1[c]) * block), area=int(area[c])))
     return regions
 
 
@@ -476,10 +511,11 @@ def find_regions(mask: np.ndarray, block: int, min_area: int) -> list[Region]:
 
 
 def luminance(arr: np.ndarray) -> np.ndarray:
+    """Luma of RGB pixels, for an image (h, w, 3) or a pixel list (n, 3)."""
     return (
-        0.299 * arr[:, :, 0].astype(np.float32)
-        + 0.587 * arr[:, :, 1].astype(np.float32)
-        + 0.114 * arr[:, :, 2].astype(np.float32)
+        0.299 * arr[..., 0].astype(np.float32)
+        + 0.587 * arr[..., 1].astype(np.float32)
+        + 0.114 * arr[..., 2].astype(np.float32)
     )
 
 
@@ -507,6 +543,10 @@ class PageDiff:
     def size(self) -> tuple[int, int]:
         h, w = self.changed.shape
         return (w, h)
+
+    @property
+    def nbytes(self) -> int:
+        return self.a.nbytes + self.b.nbytes + self.changed.nbytes + self.grown.nbytes
 
 
 def diff_page(a: np.ndarray | None, b: np.ndarray | None, opt: Options,
@@ -576,28 +616,39 @@ def render_overlay(pd: PageDiff, opt: Options) -> tuple[Image.Image, tuple[int, 
     grown = pd.grown[y0:y1, x0:x1]
     out = np.zeros((y1 - y0, x1 - x0, 4), dtype=np.uint8)
 
+    # Colours are computed on the masked pixels only, gathered by flat index
+    # and written back as packed uint32: boolean indexing of (h, w, 3) arrays
+    # is several times slower, and whole-box luminance planes slower still.
+    flat_a = np.ascontiguousarray(a).reshape(-1, 3)
+    flat_b = np.ascontiguousarray(b).reshape(-1, 3)
+    flat_out = out.view(np.uint32).reshape(-1)
+
+    def rgba(r, g, b_, alpha):
+        return (np.asarray(r, np.uint32) | (np.asarray(g, np.uint32) << 8)
+                | (np.asarray(b_, np.uint32) << 16) | (np.asarray(alpha, np.uint32) << 24))
+
     # 1. faint context: what both files have in common inside the grown area.
     if opt.keep_context:
-        context = grown & ~changed
-        if context.any():
-            ink = np.clip(255 - luminance(np.minimum(a, b)), 0, 255)  # 0 = blank paper
-            gray = np.clip(105 + ink * 0.6, 0, 255).astype(np.uint8)
-            out[context, 0] = gray[context]
-            out[context, 1] = gray[context]
-            out[context, 2] = np.clip(gray[context].astype(np.int16) + 30, 0, 255).astype(np.uint8)
-            out[context, 3] = np.where(ink[context] > 8, opt.context_alpha, 40).astype(np.uint8)
+        idx = np.flatnonzero(grown & ~changed)
+        if idx.size:
+            common = np.minimum(np.take(flat_a, idx, axis=0), np.take(flat_b, idx, axis=0))
+            ink = np.clip(255 - luminance(common), 0, 255)
+            gray = np.clip(105 + ink * 0.6, 0, 255).astype(np.uint8)  # 0 ink = blank paper
+            blue = np.minimum(gray.astype(np.int16) + 30, 255)
+            flat_out[idx] = rgba(gray, gray, blue, np.where(ink > 8, opt.context_alpha, 40))
 
     # 2. the changes themselves.
-    if changed.any():
-        ink_a = 255.0 - luminance(a)
-        ink_b = 255.0 - luminance(b)
+    idx = np.flatnonzero(changed)
+    if idx.size:
+        ink_a = 255.0 - luminance(np.take(flat_a, idx, axis=0))
+        ink_b = 255.0 - luminance(np.take(flat_b, idx, axis=0))
         # "modified": both files draw something here, only the content differs
-        modified = changed & (ink_a > 40) & (ink_b > 40)
-        removed = changed & ~modified & (ink_a > ink_b)  # ink in A, blank in B
-        added = changed & ~modified & ~removed           # ink in B, blank in A
-        out[removed] = (255, 60, 60, 235)
-        out[added] = (60, 235, 90, 235)
-        out[modified] = (255, 200, 0, 240)
+        modified = (ink_a > 40) & (ink_b > 40)
+        removed = ~modified & (ink_a > ink_b)  # ink in A, blank in B
+        px = np.full(idx.size, rgba(60, 235, 90, 235), np.uint32)  # added: ink in B only
+        px[removed] = rgba(255, 60, 60, 235)
+        px[modified] = rgba(255, 200, 0, 240)
+        flat_out[idx] = px
 
     return Image.fromarray(out, mode="RGBA"), (x0, y0)
 
@@ -605,11 +656,10 @@ def render_overlay(pd: PageDiff, opt: Options) -> tuple[Image.Image, tuple[int, 
 def checkerboard(size: tuple[int, int], tile: int = 12) -> Image.Image:
     """Neutral pattern making transparent (= identical) areas obvious."""
     w, h = size
-    light = np.full(((h + tile - 1) // tile, (w + tile - 1) // tile), 210, np.uint8)
-    ys, xs = np.indices(light.shape)
-    light[(ys + xs) % 2 == 1] = 170
-    grid = np.repeat(np.repeat(light, tile, axis=0), tile, axis=1)[:h, :w]
-    return Image.fromarray(np.dstack([grid] * 3), mode="RGB").convert("RGBA")
+    odd_col = (np.arange(w) // tile) % 2 == 1
+    odd_row = (np.arange(h) // tile) % 2 == 1
+    grid = np.where(odd_row[:, None] ^ odd_col[None, :], 170, 210).astype(np.uint8)
+    return Image.fromarray(grid, mode="L").convert("RGB")
 
 
 # --------------------------------------------------------------------------- #
@@ -637,6 +687,8 @@ class Session:
         self.scan: list[PageStats] = []
 
         self._ready: OrderedDict[int, PageDiff] = OrderedDict()
+        self._ready_bytes = 0
+        self._full = False  # cache at budget: stop prefetching, it would only evict
         self._protected: set[int] = set()
         self._wanted: list[int] = []
         self._prefetch: list[int] = []
@@ -669,7 +721,8 @@ class Session:
 
     def _next_index(self) -> int | None:
         with self._lock:
-            for pool in (self._wanted, self._prefetch):
+            pools = (self._wanted,) if self._full else (self._wanted, self._prefetch)
+            for pool in pools:
                 while pool:
                     idx = pool.pop(0)
                     if idx not in self._ready:
@@ -717,6 +770,7 @@ class Session:
         self._stop.set()
         self._wake.set()
         self._ready.clear()
+        self._ready_bytes = 0
         for doc in (self.doc_a, self.doc_b):
             try:
                 doc.close()
@@ -739,10 +793,15 @@ class Session:
 
     def pending(self) -> bool:
         with self._lock:
-            return bool(self._wanted or self._prefetch or self._inflight is not None)
+            prefetching = bool(self._prefetch) and not self._full
+            return bool(self._wanted or prefetching or self._inflight is not None)
 
     def protect(self, indices: list[int]):
-        """Pages the viewer is showing: never evict those to make room."""
+        """Pages the viewer shows or asked for: never evict those to make room.
+
+        Evicting a requested neighbour would make the viewer ask for it again
+        on the next repaint, and the worker would recompute pages forever.
+        """
         self._protected = set(indices)
 
     def get(self, index: int) -> PageDiff | None:
@@ -778,39 +837,74 @@ class Session:
         if pd.size != self.geometry[index]:  # rasterizer rounding, fix the layout
             self.geometry[index] = pd.size
             self.geom_version += 1
+        old = self._ready.pop(index, None)
+        if old is not None:
+            self._ready_bytes -= old.nbytes
         self._ready[index] = pd
-        self._ready.move_to_end(index)
-        budget = max(3, MEM_BUDGET // max(1, self._page_bytes()))
-        if len(self._ready) <= budget:
-            return
+        self._ready_bytes += pd.nbytes
+        # budget in real bytes: page sizes vary a lot inside one document
         for key in [k for k in self._ready if k not in self._protected]:
-            if len(self._ready) <= budget:
+            if self._ready_bytes <= MEM_BUDGET:
                 break
-            self._ready.pop(key, None)
-
-    def _page_bytes(self) -> int:
-        w, h = max(self.geometry, key=lambda s: s[0] * s[1])
-        return w * h * BYTES_PER_PX
+            self._ready_bytes -= self._ready.pop(key).nbytes
+        self._full = self._ready_bytes > MEM_BUDGET * 0.9
 
     # -- low-res pass ----------------------------------------------------- #
 
     def run_scan(self, progress=None) -> list[PageStats]:
-        """Low-res pass over every page, to know which ones differ."""
-        scale = (SCAN_DPI / self.opt.dpi) ** 2
-        min_area = max(2, int(round(self.opt.min_area * scale)))
+        """Low-res pass over every page, to know which ones differ.
+
+        Rasterizing holds the GIL, so threads do not help: long documents are
+        spread over worker processes instead (about 4x faster on 8 cores).
+        """
+        n = self.page_count
         self.scan = []
-        for i in range(self.page_count):
-            if progress:
-                progress(i, self.page_count)
-            pd = diff_page(
-                render_page(self.doc_a, i, SCAN_DPI),
-                render_page(self.doc_b, i, SCAN_DPI),
-                self.opt, i, SCAN_DPI, min_area,
-            )
-            self.scan.append(pd.stats)
+        workers = min(SCAN_PROCESSES, os.cpu_count() or 1, n // SCAN_PAGES_PER_PROCESS)
+        results = None
+        if workers >= 2:
+            try:
+                with ProcessPoolExecutor(workers, initializer=_scan_init,
+                                         initargs=(str(self.pdf_a), str(self.pdf_b),
+                                                   self.opt)) as pool:
+                    results = pool.map(_scan_page, range(n), chunksize=2)
+                    for i, stats in enumerate(results):
+                        if progress:
+                            progress(i, n)
+                        self.scan.append(stats)
+            except Exception:  # broken pool (frozen build quirks, memory): go serial
+                self.scan = []
+                results = None
+        if results is None:
+            _scan_init(None, None, self.opt, docs=(self.doc_a, self.doc_b))
+            for i in range(n):
+                if progress:
+                    progress(i, n)
+                self.scan.append(_scan_page(i))
         if progress:
-            progress(self.page_count, self.page_count)
+            progress(n, n)
         return self.scan
+
+
+SCAN_PROCESSES = 8          # more brings little: process start-up dominates
+SCAN_PAGES_PER_PROCESS = 6  # below that, spawning costs more than it saves
+_scan_state: dict = {}
+
+
+def _scan_init(pdf_a, pdf_b, opt: Options, docs=None):
+    """Per-process setup for the scan: open both documents once."""
+    if docs is None:
+        docs = (fitz.open(pdf_a), fitz.open(pdf_b))
+    _scan_state.update(docs=docs, opt=opt)
+
+
+def _scan_page(index: int) -> PageStats:
+    doc_a, doc_b = _scan_state["docs"]
+    opt = _scan_state["opt"]
+    scale = (SCAN_DPI / opt.dpi) ** 2
+    min_area = max(2, int(round(opt.min_area * scale)))
+    return diff_page(render_page(doc_a, index, SCAN_DPI),
+                     render_page(doc_b, index, SCAN_DPI),
+                     opt, index, SCAN_DPI, min_area).stats
 
 
 # --------------------------------------------------------------------------- #
@@ -820,8 +914,21 @@ class Session:
 ZOOM_STEPS = (0.1, 0.15, 0.25, 0.33, 0.5, 0.66, 0.8, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0)
 BOX_COLOR = "#ff00dc"
 CANVAS_BG = (58, 58, 58)
-IMAGE_CACHE = 10       # page images (full size or pre-scaled) kept around
-SLICE_CACHE = 8        # scaled visible slices kept around
+# Display caches are bounded in bytes, not entries: a continuous strip of small
+# pages needs dozens of images on screen at once, a zoomed big page only two.
+IMAGE_CACHE_BYTES = 160 * 1024**2    # page images (full size or pre-scaled)
+SLICE_CACHE_BYTES = 64 * 1024**2     # scaled visible slices
+OVERLAY_CACHE_BYTES = 128 * 1024**2  # flattened overlays, per background
+
+
+def _lru_put(cache: OrderedDict, key, img: Image.Image, limit: int):
+    """Insert as most recent, then evict the oldest entries beyond `limit` bytes."""
+    cache[key] = img
+    cache.move_to_end(key)
+    total = sum(v.width * v.height * len(v.getbands()) for v in cache.values())
+    while total > limit and len(cache) > 1:
+        _, old = cache.popitem(last=False)
+        total -= old.width * old.height * len(old.getbands())
 PRESCALE_BELOW = 0.5   # zoom under which whole pages are pre-scaled and cached
 QUALITY_DELAY = 110    # ms of calm before repainting with the good filter
 
@@ -865,7 +972,7 @@ class App(ttk.Frame):
         self._frame_item: int | None = None
         self._images: OrderedDict[tuple, Image.Image] = OrderedDict()
         self._slices: OrderedDict[tuple, Image.Image] = OrderedDict()
-        self._overlays: OrderedDict[tuple, np.ndarray] = OrderedDict()
+        self._overlays: OrderedDict[tuple, Image.Image] = OrderedDict()
         self._layout_cache: tuple | None = None
         self._ref = (0.0, 1.0)  # divider reference: page left x, page width (canvas px)
         self._list_index: list[int] = []
@@ -1480,31 +1587,32 @@ class App(ttk.Frame):
 
     # -- page sources ----------------------------------------------------- #
 
-    def _overlay_source(self, index: int, pd: PageDiff) -> np.ndarray:
+    def _overlay_source(self, index: int, pd: PageDiff) -> Image.Image:
         """Overlay flattened on the chosen background, cached per page + bg."""
         key = (index, self.background.get())
-        arr = self._overlays.get(key)
-        if arr is None:
+        img = self._overlays.get(key)
+        if img is None:
             if self.background.get() == "damier":
-                base = checkerboard(pd.size)
+                img = checkerboard(pd.size)
             else:
-                fill = (0, 0, 0, 255) if self.background.get() == "noir" else (255, 255, 255, 255)
-                base = Image.new("RGBA", pd.size, fill)
+                fill = (0, 0, 0) if self.background.get() == "noir" else (255, 255, 255)
+                img = Image.new("RGB", pd.size, fill)
             rendered = render_overlay(pd, self.session.opt)
             if rendered:
                 overlay, origin = rendered
-                base.alpha_composite(overlay, dest=origin)
-            arr = np.asarray(base.convert("RGB"))
-            if len(self._overlays) > 4:
-                self._overlays.popitem(last=False)
-            self._overlays[key] = arr
-        return arr
+                # RGBA pasted with its own alpha as mask: blends straight onto the
+                # RGB base, no full-page RGBA round trip
+                img.paste(overlay, origin, overlay)
+            _lru_put(self._overlays, key, img, OVERLAY_CACHE_BYTES)
+        else:
+            self._overlays.move_to_end(key)
+        return img
 
-    def _base_array(self, index: int, pd: PageDiff, key: str) -> np.ndarray:
+    def _base_image(self, index: int, pd: PageDiff, key: str) -> Image.Image:
         if key == "a":
-            return pd.a
+            return Image.fromarray(pd.a, mode="RGB")  # shares the array, no copy
         if key == "b":
-            return pd.b
+            return Image.fromarray(pd.b, mode="RGB")
         return self._overlay_source(index, pd)
 
     def _page_image(self, index: int, pd: PageDiff, key: str,
@@ -1516,15 +1624,15 @@ class App(ttk.Frame):
         pre-scaled to the on-screen size, worth it in the thumbnail regime where
         it is reused across repaints.
         """
+        if display is None:  # full size: a view on the arrays or the overlay cache
+            return self._base_image(index, pd, key)
         ck = (index, key, display, self.background.get() if key == "overlay" else None)
         img = self._images.get(ck)
         if img is None:
-            img = Image.fromarray(self._base_array(index, pd, key), mode="RGB")
+            img = self._base_image(index, pd, key)
             if display and img.size != display:
                 img = img.resize(display, Image.BILINEAR, reducing_gap=2.0)
-            if len(self._images) > IMAGE_CACHE:
-                self._images.popitem(last=False)
-            self._images[ck] = img
+            _lru_put(self._images, ck, img, IMAGE_CACHE_BYTES)
         else:
             self._images.move_to_end(ck)
         return img
@@ -1545,9 +1653,7 @@ class App(ttk.Frame):
             if img.size != dest_size:
                 smooth = dest_size[0] < img.size[0] and not self._fast_paint
                 img = img.resize(dest_size, Image.BILINEAR if smooth else Image.NEAREST)
-            if len(self._slices) > SLICE_CACHE:
-                self._slices.popitem(last=False)
-            self._slices[ck] = img
+            _lru_put(self._slices, ck, img, SLICE_CACHE_BYTES)
         else:
             self._slices.move_to_end(ck)
         return img
@@ -1774,13 +1880,13 @@ class App(ttk.Frame):
         """Tell the worker what to compute next: what is on screen, then around."""
         pages = self._layout_pages()
         wanted = [b[0] for b in visible]
-        self.session.protect(wanted)
         if pages and wanted:
             first, last = pages.index(wanted[0]), pages.index(wanted[-1])
             for offset in (1, 2, 3):
                 for index in (last + offset, first - offset):
                     if 0 <= index < len(pages):
                         wanted.append(pages[index])
+        self.session.protect(wanted)
         self.session.focus(wanted)
 
     def _update_current_from_scroll(self, visible, pad_y: float):
@@ -1954,4 +2060,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # scan workers re-launch the PyInstaller exe
     sys.exit(main())

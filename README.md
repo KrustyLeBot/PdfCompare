@@ -18,7 +18,7 @@ conversion scripts, and a GitLab vulnerability bulk-resolver.
 A Windows GUI that renders two PDFs and shows what changed, page by page.
 
 **[⬇ Download ComparePdf.exe](https://github.com/KrustyLeBot/dev-scripts/raw/main/Pdf/dist/ComparePdf.exe)**
-— single file, no installation, no Python needed (~62 MB).
+— single file, no installation, no Python needed (~67 MB).
 
 ![icon](Pdf/icon.png)
 
