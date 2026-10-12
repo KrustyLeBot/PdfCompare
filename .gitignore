@@ -9,3 +9,7 @@ Gitlab/cve_progress_*.txt
 Pdf/dist/*
 !Pdf/dist/ComparePdf.exe
 /Pdf/__pycache__
+
+# PyInstaller build artefacts (README build command)
+/build/
+/*.spec
