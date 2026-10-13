@@ -960,7 +960,8 @@ class App(ttk.Frame):
         self.zoom = 1.0
         self.ox = 0.0          # scroll offsets, in zoomed px
         self.oy = 0.0
-        self.split = 0.5       # divider position, fraction of the page width
+        self.splits: dict[int, float] = {}  # divider per page, fraction of its width
+        self._drag_page: int | None = None  # page whose divider is being dragged
         self._dragging_handle = False
         self._pan_from: tuple[float, float] | None = None
         self._drag_side: str | None = None  # half hovered by a file drag
@@ -974,7 +975,7 @@ class App(ttk.Frame):
         self._slices: OrderedDict[tuple, Image.Image] = OrderedDict()
         self._overlays: OrderedDict[tuple, Image.Image] = OrderedDict()
         self._layout_cache: tuple | None = None
-        self._ref = (0.0, 1.0)  # divider reference: page left x, page width (canvas px)
+        self._page_rects: list[tuple] = []  # visible pages: index, x, w, top, bottom (canvas px)
         self._list_index: list[int] = []
 
         self.path_a = tk.StringVar()
@@ -1303,6 +1304,7 @@ class App(ttk.Frame):
             return
 
         self.session = session
+        self.splits = {}
         self.run_btn.state(["!disabled"])
         self.bar.configure(value=0)
         self._fill_page_list()
@@ -1542,21 +1544,30 @@ class App(ttk.Frame):
 
     def _on_arrow(self, direction: int):
         if self.view.get() == "slide" and self.session:
-            self.split = max(0.0, min(1.0, self.split + direction * 0.02))
+            self.splits[self.current] = max(0.0, min(1.0, self.split(self.current) + direction * 0.02))
             self._schedule_redraw(fast=True)
         else:
             self.step(direction)
 
     # -- mouse: divider vs pan -------------------------------------------- #
 
-    def _handle_x(self) -> float:
-        ref_x, ref_w = self._ref
-        return ref_x + self.split * ref_w
+    def split(self, index: int) -> float:
+        return self.splits.get(index, 0.5)
+
+    def _handle_page(self, x: float, y: float) -> int | None:
+        """Page whose divider lies under the pointer, if any."""
+        if self.view.get() != "slide" or not self.session:
+            return None
+        for index, page_x, pw, top, bottom in self._page_rects:
+            if top <= y <= bottom and abs(x - (page_x + self.split(index) * pw)) <= HANDLE_GRAB:
+                return index
+        return None
 
     def _on_press(self, event):
-        if (self.view.get() == "slide" and self.session
-                and abs(event.x - self._handle_x()) <= HANDLE_GRAB):
+        page = self._handle_page(event.x, event.y)
+        if page is not None:
             self._dragging_handle = True
+            self._drag_page = page
             self._set_split_from_x(event.x)
         else:
             self._pan_from = (event.x + self.ox, event.y + self.oy)
@@ -1571,18 +1582,19 @@ class App(ttk.Frame):
 
     def _on_release(self, _event):
         self._dragging_handle = False
+        self._drag_page = None
         self._pan_from = None
 
     def _on_hover(self, event):
-        near = (self.view.get() == "slide" and self.session
-                and abs(event.x - self._handle_x()) <= HANDLE_GRAB)
+        near = self._handle_page(event.x, event.y) is not None
         self.canvas.configure(cursor="sb_h_double_arrow" if near else "")
 
     def _set_split_from_x(self, canvas_x: float):
-        ref_x, ref_w = self._ref
-        if ref_w <= 0:
+        rect = next((r for r in self._page_rects if r[0] == self._drag_page), None)
+        if rect is None or rect[2] <= 0:
             return
-        self.split = max(0.0, min(1.0, (canvas_x - ref_x) / ref_w))
+        _, page_x, pw, _, _ = rect
+        self.splits[self._drag_page] = max(0.0, min(1.0, (canvas_x - page_x) / pw))
         self._schedule_redraw(fast=True)
 
     # -- page sources ----------------------------------------------------- #
@@ -1734,23 +1746,21 @@ class App(ttk.Frame):
         pad_y = max(0.0, (vh - total_h) / 2)
         visible = self._visible_bands()
 
-        first_ref = None
+        rects = []
         for index, ytop, pw, ph in visible:
             page_x = (max_w - pw) / 2 - self.ox + pad_x
             page_y = ytop - self.oy + pad_y
-            if first_ref is None:
-                first_ref = (page_x, pw)
+            rects.append((index, page_x, pw, max(0.0, page_y), min(float(vh), page_y + ph)))
             pd = self.session.get(index)
             if pd is None:
                 self._paint_pending(index, page_x, page_y, pw, ph)
                 continue
             self._paint_page(index, pd, page_x, page_y, pw, ph)
-        if first_ref:
-            self._ref = first_ref
+        self._page_rects = rects
 
         self._commit_frame()
         if self.view.get() == "slide" and visible:
-            self._draw_divider(visible, max_w, pad_x, pad_y)
+            self._draw_divider()
         if self._drag_side:
             self._draw_drop_panels(over_comparison=True)
 
@@ -1805,7 +1815,7 @@ class App(ttk.Frame):
             # destination pixel and the divider is drawn exactly there.
             after = self._slice(index, pd, "b", box, dest_size, display)
             self._blit(after, dest_x, dest_y)
-            cut = max(0, min(dest_size[0], int(round(page_x + self.split * pw)) - dest_x))
+            cut = max(0, min(dest_size[0], int(round(page_x + self.split(index) * pw)) - dest_x))
             if cut:
                 before = self._slice(index, pd, "a", box, dest_size, display)
                 self._blit(before.crop((0, 0, cut, dest_size[1])), dest_x, dest_y)
@@ -1852,29 +1862,25 @@ class App(ttk.Frame):
                 outline=BOX_COLOR, width=2, dash=dash,
              tags="vec")
 
-    def _draw_divider(self, visible, max_w: float, pad_x: float, pad_y: float):
-        """Vertical divider across the visible pages, with a round grab handle."""
-        vw, vh = self._viewport()
-        for _, ytop, pw, ph in visible:
-            page_x = (max_w - pw) / 2 - self.ox + pad_x
-            x = float(int(round(page_x + self.split * pw)))  # the seam pixel
-            if x < 0 or x > vw:
-                continue
-            top = max(0.0, ytop - self.oy + pad_y)
-            bottom = min(float(vh), ytop + ph - self.oy + pad_y)
-            if bottom <= top:
+    def _draw_divider(self):
+        """One vertical divider per visible page, each with its own grab handle."""
+        vw, _ = self._viewport()
+        r = 15
+        for index, page_x, pw, top, bottom in self._page_rects:
+            x = float(int(round(page_x + self.split(index) * pw)))  # the seam pixel
+            if x < 0 or x > vw or bottom <= top:
                 continue
             self.canvas.create_line(x, top, x, bottom, fill="#ffffff", width=3, tags="vec")
             self.canvas.create_line(x, top, x, bottom, fill="#202020", width=1, tags="vec")
-        x = self._handle_x()
-        cy = vh / 2
-        r = 15
-        self.canvas.create_oval(x - r, cy - r, x + r, cy + r,
-                                fill="#f5f5f5", outline="#202020", width=1, tags="vec")
-        for sign in (-1, 1):
-            tip, base = x + sign * 9, x + sign * 3
-            self.canvas.create_polygon(tip, cy, base, cy - 6, base, cy + 6,
-                                       fill="#202020", outline="", tags="vec")
+            if bottom - top < 2 * r + 4:
+                continue
+            cy = (top + bottom) / 2
+            self.canvas.create_oval(x - r, cy - r, x + r, cy + r,
+                                    fill="#f5f5f5", outline="#202020", width=1, tags="vec")
+            for sign in (-1, 1):
+                tip, base = x + sign * 9, x + sign * 3
+                self.canvas.create_polygon(tip, cy, base, cy - 6, base, cy + 6,
+                                           fill="#202020", outline="", tags="vec")
 
     def _request_pages(self, visible):
         """Tell the worker what to compute next: what is on screen, then around."""
@@ -1952,7 +1958,7 @@ class App(ttk.Frame):
         pd = self.session.get(self.current)
         stats = pd.stats if pd else self.session.scan[self.current]
         note = f"  [{stats.note}]" if stats.note else ""
-        wipe = T("wipe_amount", value=self.split * 100) if self.view.get() == "slide" else ""
+        wipe = T("wipe_amount", value=self.split(self.current) * 100) if self.view.get() == "slide" else ""
         busy = T("busy") if self.session.pending() else ""
         zoom = T("zoom", auto=T("zoom_auto") if self.fit.get() else "",
                  value=self.zoom * 100)
@@ -1970,7 +1976,7 @@ class App(ttk.Frame):
         w, h = pd.size
         img = self._page_image(self.current, pd, self._source_key(), None).copy()
         if self.view.get() == "slide":
-            cut = max(0, min(w, int(round(self.split * w))))
+            cut = max(0, min(w, int(round(self.split(self.current) * w))))
             if cut:
                 before = self._page_image(self.current, pd, "a", None)
                 img.paste(before.crop((0, 0, cut, h)), (0, 0))
