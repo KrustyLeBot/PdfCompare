@@ -1,14 +1,8 @@
-*.i
-*.ii
-*.gpu
-*.ptx
-*.cubin
-*.fatbin
 .env
-Gitlab/cve_progress_*.txt
-Pdf/dist/*
-!Pdf/dist/ComparePdf.exe
-/Pdf/__pycache__
+__pycache__/
+
+dist/*
+!dist/ComparePdf.exe
 
 # PyInstaller build artefacts (README build command)
 /build/
