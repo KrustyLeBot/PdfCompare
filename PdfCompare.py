@@ -15,7 +15,7 @@ Pages are compared lazily by a background worker and cached, so scrolling and
 jumping between pages does not recompute what is already known.
 
 The interface follows the system language (English or French, English by
-default); set PDFDIFF_LANG=fr or =en to force it.
+default); set PDFCOMPARE_LANG=fr or =en to force it.
 
 Nothing is written to disk unless the save button is used.
 
@@ -219,7 +219,7 @@ STRINGS: dict[str, dict[str, str]] = {
 
 def detect_language() -> str:
     """System UI language, English unless it is clearly French."""
-    forced = os.environ.get("PDFDIFF_LANG", "").strip().lower()[:2]
+    forced = os.environ.get("PDFCOMPARE_LANG", "").strip().lower()[:2]
     if forced in STRINGS:
         return forced
     for name in ("LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"):

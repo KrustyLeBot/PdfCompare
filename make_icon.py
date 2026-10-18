@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the application icon for compare_pdf (icon.ico).
+"""Generate the application icon for PdfCompare (icon.ico).
 
 Two overlapping pages split by a wipe divider, with one changed area boxed in
 magenta -- the same idea the viewer shows. Run this only when the icon needs to
