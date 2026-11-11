@@ -66,8 +66,10 @@ works and the file pickers stay available.
 ## Rebuilding the exe
 
 A push to `main` that touches `PdfCompare.py` or `icon.ico` rebuilds the exe on a
-Windows runner (`.github/workflows/build-exe.yml`) and commits it to
-`dist/PdfCompare.exe`. Run the workflow by hand from the Actions tab to force a
+Windows runner (`.github/workflows/build-exe.yml`), publishes it as a new
+release (`build-N`, the latest one is always at
+[releases/latest](https://github.com/KrustyLeBot/PdfCompare/releases/latest))
+and commits it to `dist/PdfCompare.exe`. Run the workflow by hand from the Actions tab to force a
 rebuild. To build locally:
 
 ```bash
