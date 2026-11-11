@@ -3,7 +3,7 @@
 Visual PDF and image comparison for Windows: drop two PDFs or images, see what
 changed, page by page.
 
-**[⬇ Download PdfCompare.exe](https://github.com/KrustyLeBot/PdfCompare/raw/main/dist/PdfCompare.exe)**
+**[⬇ Download PdfCompare.exe](https://github.com/KrustyLeBot/PdfCompare/releases/latest/download/PdfCompare.exe)**
 — single file, no installation, no Python needed (~67 MB).
 
 ![icon](icon.png)
@@ -66,10 +66,10 @@ works and the file pickers stay available.
 ## Rebuilding the exe
 
 A push to `main` that touches `PdfCompare.py` or `icon.ico` rebuilds the exe on a
-Windows runner (`.github/workflows/build-exe.yml`), publishes it as a new
+Windows runner (`.github/workflows/build-exe.yml`) and publishes it as a new
 release (`build-N`, the latest one is always at
-[releases/latest](https://github.com/KrustyLeBot/PdfCompare/releases/latest))
-and commits it to `dist/PdfCompare.exe`. Run the workflow by hand from the Actions tab to force a
+[releases/latest](https://github.com/KrustyLeBot/PdfCompare/releases/latest)).
+The exe is not committed to the repository. Run the workflow by hand from the Actions tab to force a
 rebuild. To build locally:
 
 ```bash

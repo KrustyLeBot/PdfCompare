@@ -1,8 +1,7 @@
 .env
 __pycache__/
 
-dist/*
-!dist/PdfCompare.exe
+dist/
 
 # PyInstaller build artefacts (README build command)
 /build/

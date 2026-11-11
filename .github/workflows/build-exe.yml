@@ -20,9 +20,9 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -35,12 +35,6 @@ jobs:
           --name PdfCompare --icon icon.ico --add-data "icon.ico;."
           --collect-all tkinterdnd2 --distpath dist PdfCompare.py
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: PdfCompare
-          path: dist/PdfCompare.exe
-
       - name: Publish a release
         shell: bash
         env:
@@ -51,18 +45,3 @@ jobs:
             --title "PdfCompare build ${{ github.run_number }}" \
             --generate-notes
 
-      # The README download link points at dist/PdfCompare.exe on main.
-      # A push made with GITHUB_TOKEN does not trigger workflows, so no loop.
-      - name: Commit the exe to main
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898798+github-actions[bot]@users.noreply.github.com"
-          git add dist/PdfCompare.exe
-          if git diff --cached --quiet; then
-            echo "exe unchanged"
-            exit 0
-          fi
-          git commit -m "Rebuild PdfCompare.exe for ${GITHUB_SHA::7}"
-          git pull --rebase origin main
-          git push origin HEAD:main
