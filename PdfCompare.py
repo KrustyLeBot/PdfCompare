@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Visual diff of two PDF files, displayed in a GUI viewer.
+"""Visual diff of two PDF or image files, displayed in a GUI viewer.
 
-Drop two PDFs on the window (left half = before, right half = after) and the
+Images (PNG, JPEG, BMP, GIF, TIFF, WebP) are wrapped in a one-page-per-frame
+PDF, so the rest of the pipeline only ever sees PDFs.
+
+Drop two files on the window (left half = before, right half = after) and the
 whole document is shown as one scrollable strip:
 
   * "wipe" (default): both pages superposed, with a divider you drag left and
@@ -40,7 +43,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageDraw, ImageOps, ImageSequence, ImageTk
 
 try:
     import pymupdf as fitz
@@ -59,13 +62,15 @@ except ImportError:  # drag and drop is optional
 
 STRINGS: dict[str, dict[str, str]] = {
     "en": {
-        "title": "Visual comparison of 2 PDFs",
-        "pdf_before": "PDF 1 (before)",
-        "pdf_after": "PDF 2 (after)",
+        "title": "Visual comparison of 2 PDFs or images",
+        "pdf_before": "File 1 (before)",
+        "pdf_after": "File 2 (after)",
         "browse": "Browse...",
         "swap": "Swap",
-        "pick_before": "Select the reference PDF",
-        "pick_after": "Select the PDF to compare",
+        "pick_before": "Select the reference PDF or image",
+        "pick_after": "Select the PDF or image to compare",
+        "filetype_all": "PDF and images",
+        "filetype_images": "Images",
         "options": "Comparison options",
         "dpi": "dpi",
         "threshold": "threshold",
@@ -87,8 +92,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "bg_damier": "checkerboard",
         "bg_noir": "black",
         "bg_blanc": "white",
-        "start_hint": "Pick two PDFs, then Compare.",
-        "dpi_detected": "Resolution set to {dpi} dpi (native resolution of PDF 1).",
+        "start_hint": "Pick two PDFs or images, then Compare.",
+        "dpi_detected": "Resolution set to {dpi} dpi (native resolution of file 1).",
         "scanning": "Scanning...",
         "scanning_page": "Scanning page {done}/{total}...",
         "page_status": ("Page {page}/{total} — {ratio:.3f}% of pixels differ, "
@@ -102,8 +107,8 @@ STRINGS: dict[str, dict[str, str]] = {
                          "Ctrl+wheel = zoom"),
         "legend_overlay": ("red = removed   green = added   yellow = modified   "
                            "magenta = area   transparent = identical"),
-        "missing_pdf_title": "Missing PDF",
-        "missing_pdf": "Select two PDF files.",
+        "missing_pdf_title": "Missing file",
+        "missing_pdf": "Select two PDF or image files.",
         "not_found_title": "File not found",
         "not_found": "One of the paths does not exist.",
         "error": "Error",
@@ -115,35 +120,37 @@ STRINGS: dict[str, dict[str, str]] = {
         "nothing_to_save": "Run a comparison first.",
         "save_title": "Save the current page",
         "saved": "Image saved: {path}",
-        "swapped": "PDFs swapped.",
-        "drop_no_pdf": "Drag and drop: no PDF file in what was dropped.",
-        "drop_partial": "{name} loaded. The {slot} PDF is still needed.",
+        "swapped": "Files swapped.",
+        "drop_no_pdf": "Drag and drop: no PDF or image file in what was dropped.",
+        "drop_partial": "{name} loaded. The {slot} file is still needed.",
         "slot_after": "AFTER (right)",
         "slot_before": "BEFORE (left)",
-        "panel_before": "BEFORE  (PDF 1)",
-        "panel_after": "AFTER  (PDF 2)",
-        "panel_drop_here": "drag a PDF here",
+        "panel_before": "BEFORE  (file 1)",
+        "panel_after": "AFTER  (file 2)",
+        "panel_drop_here": "drag a PDF or image here",
         "panel_release": "release here",
         "panel_ok": "OK",
-        "panel_hint": "Drag and drop the PDFs (left = before, right = after)",
-        "panel_hint_nodnd": ("Pick the PDFs with Browse... then Compare "
+        "panel_hint": "Drag and drop the PDFs or images (left = before, right = after)",
+        "panel_hint_nodnd": ("Pick the files with Browse... then Compare "
                              "(drag and drop unavailable: tkinterdnd2 missing)"),
         "page_pending": "page {page} — comparing...",
         "page_short": "p{page}",
         "page_row": "page {page:>3}",
-        "note_added": "page missing from PDF 1 (added)",
-        "note_removed": "page missing from PDF 2 (removed)",
+        "note_added": "page missing from file 1 (added)",
+        "note_removed": "page missing from file 2 (removed)",
         "note_size": ("different page size ({w1}x{h1} vs {w2}x{h2}), "
                       "aligned top-left"),
     },
     "fr": {
-        "title": "Comparaison visuelle de 2 PDF",
-        "pdf_before": "PDF 1 (avant)",
-        "pdf_after": "PDF 2 (apres)",
+        "title": "Comparaison visuelle de 2 PDF ou images",
+        "pdf_before": "Fichier 1 (avant)",
+        "pdf_after": "Fichier 2 (apres)",
         "browse": "Parcourir...",
         "swap": "Inverser",
-        "pick_before": "Selectionner le PDF de reference",
-        "pick_after": "Selectionner le PDF a comparer",
+        "pick_before": "Selectionner le PDF ou l'image de reference",
+        "pick_after": "Selectionner le PDF ou l'image a comparer",
+        "filetype_all": "PDF et images",
+        "filetype_images": "Images",
         "options": "Options de comparaison",
         "dpi": "dpi",
         "threshold": "seuil",
@@ -165,8 +172,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "bg_damier": "damier",
         "bg_noir": "noir",
         "bg_blanc": "blanc",
-        "start_hint": "Choisir deux PDF puis Comparer.",
-        "dpi_detected": "Resolution reglee sur {dpi} dpi (resolution native du PDF 1).",
+        "start_hint": "Choisir deux PDF ou images puis Comparer.",
+        "dpi_detected": "Resolution reglee sur {dpi} dpi (resolution native du fichier 1).",
         "scanning": "Analyse...",
         "scanning_page": "Analyse page {done}/{total}...",
         "page_status": ("Page {page}/{total} — {ratio:.3f}% de pixels differents, "
@@ -180,8 +187,8 @@ STRINGS: dict[str, dict[str, str]] = {
                          "Ctrl+molette = zoom"),
         "legend_overlay": ("rouge = supprime   vert = ajoute   jaune = modifie   "
                            "magenta = zone   transparent = identique"),
-        "missing_pdf_title": "PDF manquant",
-        "missing_pdf": "Selectionner deux fichiers PDF.",
+        "missing_pdf_title": "Fichier manquant",
+        "missing_pdf": "Selectionner deux fichiers PDF ou images.",
         "not_found_title": "Fichier introuvable",
         "not_found": "Un des chemins n'existe pas.",
         "error": "Erreur",
@@ -193,24 +200,24 @@ STRINGS: dict[str, dict[str, str]] = {
         "nothing_to_save": "Lancer d'abord une comparaison.",
         "save_title": "Enregistrer la page affichee",
         "saved": "Image enregistree : {path}",
-        "swapped": "PDF inverses.",
-        "drop_no_pdf": "Glisser-deposer : aucun fichier PDF dans ce qui a ete lache.",
-        "drop_partial": "{name} charge. Il reste le PDF {slot} a deposer.",
+        "swapped": "Fichiers inverses.",
+        "drop_no_pdf": "Glisser-deposer : aucun PDF ni image dans ce qui a ete lache.",
+        "drop_partial": "{name} charge. Il reste le fichier {slot} a deposer.",
         "slot_after": "APRES (droite)",
         "slot_before": "AVANT (gauche)",
-        "panel_before": "AVANT  (PDF 1)",
-        "panel_after": "APRES  (PDF 2)",
-        "panel_drop_here": "glisser un PDF ici",
+        "panel_before": "AVANT  (fichier 1)",
+        "panel_after": "APRES  (fichier 2)",
+        "panel_drop_here": "glisser un PDF ou une image ici",
         "panel_release": "lacher ici",
         "panel_ok": "OK",
-        "panel_hint": "Glisser-deposer les PDF (gauche = avant, droite = apres)",
-        "panel_hint_nodnd": ("Choisir les PDF avec Parcourir... puis Comparer "
+        "panel_hint": "Glisser-deposer les PDF ou images (gauche = avant, droite = apres)",
+        "panel_hint_nodnd": ("Choisir les fichiers avec Parcourir... puis Comparer "
                              "(glisser-deposer indisponible : tkinterdnd2 absent)"),
         "page_pending": "page {page} — comparaison...",
         "page_short": "p{page}",
         "page_row": "page {page:>3}",
-        "note_added": "page absente du PDF 1 (ajoutee)",
-        "note_removed": "page absente du PDF 2 (supprimee)",
+        "note_added": "page absente du fichier 1 (ajoutee)",
+        "note_removed": "page absente du fichier 2 (supprimee)",
         "note_size": ("taille de page differente ({w1}x{h1} vs {w2}x{h2}), "
                       "alignement haut-gauche"),
     },
@@ -262,15 +269,45 @@ DEFAULT_DPI = 200
 DPI_LIMITS = (96, 300)  # a page at 300 dpi already weighs ~120 MB in the cache
 
 
+# Images are wrapped in a PDF whose page is sized so that rendering at this dpi
+# gives back the original pixels; one value for all images keeps two images of
+# the same pixel size on the same page size, whatever dpi their metadata claims.
+IMAGE_DPI = DEFAULT_DPI
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp")
+SUPPORTED_SUFFIXES = (".pdf",) + IMAGE_SUFFIXES
+
+
+def is_supported(path: Path) -> bool:
+    return path.suffix.lower() in SUPPORTED_SUFFIXES and path.is_file()
+
+
+def open_document(path) -> "fitz.Document":
+    """Open a PDF, or an image as a PDF with one page per frame."""
+    path = Path(path)
+    if path.suffix.lower() not in IMAGE_SUFFIXES:
+        return fitz.open(path)
+    doc = fitz.open()
+    scale = 72.0 / IMAGE_DPI
+    with Image.open(path) as img:
+        for frame in ImageSequence.Iterator(img):
+            frame = ImageOps.exif_transpose(frame)  # phone photos store rotation in EXIF
+            alpha = frame.mode in ("RGBA", "LA", "PA") or "transparency" in frame.info
+            frame = frame.convert("RGBA" if alpha else "RGB")
+            pix = fitz.Pixmap(fitz.csRGB, frame.width, frame.height, frame.tobytes(), alpha)
+            page = doc.new_page(width=frame.width * scale, height=frame.height * scale)
+            page.insert_image(page.rect, pixmap=pix)
+    return doc
+
+
 def native_dpi(path: Path, pages: int = 3) -> int | None:
-    """Effective dpi of the raster content of a PDF, if it has any.
+    """Effective dpi of the raster content of a PDF or image, if it has any.
 
     A scanned page is one big image placed on the page box: comparing it below
     its own resolution throws away detail and invents anti-aliasing differences,
     so the viewer defaults to that resolution. Vector-only PDFs return None.
     """
     try:
-        doc = fitz.open(path)
+        doc = open_document(path)
     except Exception:
         return None
     best = 0.0
@@ -679,8 +716,8 @@ class Session:
         self.pdf_a = pdf_a
         self.pdf_b = pdf_b
         self.opt = opt
-        self.doc_a = fitz.open(pdf_a)
-        self.doc_b = fitz.open(pdf_b)
+        self.doc_a = open_document(pdf_a)
+        self.doc_b = open_document(pdf_b)
         self.page_count = max(self.doc_a.page_count, self.doc_b.page_count)
         self.geometry = self._page_geometry()
         self.geom_version = 0
@@ -732,8 +769,8 @@ class Session:
             return None
 
     def _work(self):
-        doc_a = fitz.open(self.pdf_a)
-        doc_b = fitz.open(self.pdf_b)
+        doc_a = open_document(self.pdf_a)
+        doc_b = open_document(self.pdf_b)
         try:
             while not self._stop.is_set():
                 idx = self._next_index()
@@ -893,7 +930,7 @@ _scan_state: dict = {}
 def _scan_init(pdf_a, pdf_b, opt: Options, docs=None):
     """Per-process setup for the scan: open both documents once."""
     if docs is None:
-        docs = (fitz.open(pdf_a), fitz.open(pdf_b))
+        docs = (open_document(pdf_a), open_document(pdf_b))
     _scan_state.update(docs=docs, opt=opt)
 
 
@@ -1197,11 +1234,11 @@ class App(ttk.Frame):
             dropped = [Path(p) for p in self.tk.splitlist(event.data)]
         except tk.TclError:
             dropped = []
-        pdfs = [p for p in dropped if p.suffix.lower() == ".pdf" and p.is_file()]
+        pdfs = [p for p in dropped if is_supported(p)]
         if not pdfs:
             # a single unquoted path containing spaces got split into words
             single = Path(str(event.data).strip("{}"))
-            if single.suffix.lower() == ".pdf" and single.is_file():
+            if is_supported(single):
                 pdfs = [single]
         if not pdfs:
             self._schedule_redraw()
@@ -1247,7 +1284,11 @@ class App(ttk.Frame):
 
     def _pick(self, var: tk.StringVar, title: str):
         path = filedialog.askopenfilename(
-            title=title, filetypes=[("PDF", "*.pdf"), ("*", "*.*")]
+            title=title,
+            filetypes=[(T("filetype_all"), " ".join("*" + x for x in SUPPORTED_SUFFIXES)),
+                       ("PDF", "*.pdf"),
+                       (T("filetype_images"), " ".join("*" + x for x in IMAGE_SUFFIXES)),
+                       ("*", "*.*")],
         )
         if path:
             var.set(path)
